@@ -7,7 +7,7 @@ export async function proxyRequest(path: string, searchParams: string, originalH
     const protocol = host.includes('localhost') ? 'http' : 'https';
     const localBase = `${protocol}://${host}`;
 
-    // 1. Asset Proxying (Static files)
+    // 1. Asset Proxying
     if (path.startsWith('_xh_assets/')) {
         let actualAssetUrl = path.replace('_xh_assets/', '');
         if (actualAssetUrl.includes('_xh_assets/')) {
@@ -19,7 +19,13 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         return proxyAsset(actualAssetUrl, originalHeaders, localBase);
     }
 
-    const url = `${TARGET_URL}/${path}${searchParams ? `?${searchParams}` : ''}`;
+    // 2. INTERNAL REDIRECT: Redirect root to /videos to bypass root landing page
+    let finalPath = path;
+    if (path === '' || path === '/') {
+        finalPath = 'videos';
+    }
+
+    const url = `${TARGET_URL}/${finalPath}${searchParams ? `?${searchParams}` : ''}`;
 
     try {
         const headers = new Headers();
@@ -28,18 +34,18 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         headers.set('Accept-Language', 'en-US,en;q=0.9');
         headers.set('Referer', 'https://www.google.com/');
 
-        // Pass real user IP to bypass Virginia/USA restrictions
+        // Pass real user IP headers
         const clientIP = originalHeaders.get('x-forwarded-for')?.split(',')[0].trim();
         if (clientIP) {
             headers.set('X-Forwarded-For', clientIP);
             headers.set('X-Real-IP', clientIP);
         }
 
-        // Force Cookies for Age Verification
+        // Force Cookies for Age Verification and bypassing landing pages
         let cookieArr = [];
         const existingCookie = originalHeaders.get('cookie');
         if (existingCookie) cookieArr.push(existingCookie);
-        cookieArr.push('age_confirmed=1', 'is_adult=1', 'ah_age_confirmed=true', 'f_adult=1');
+        cookieArr.push('age_confirmed=1', 'is_adult=1', 'ah_age_confirmed=true', 'f_adult=1', 'is_mature=1', 'access_granted=true');
         headers.set('Cookie', cookieArr.join('; '));
 
         const response = await fetch(url, {
@@ -47,6 +53,12 @@ export async function proxyRequest(path: string, searchParams: string, originalH
             headers,
             redirect: 'follow',
         });
+
+        // 3. SECONARY BYPASS: If even /videos gives a wall (redirects to /lp/ or /signup)
+        if (response.url.includes('/lp/') || response.url.includes('/signup') || response.url.includes('/join')) {
+            // Try a very specific deep link that is hard to wall
+            if (!path.includes('best')) return proxyRequest('best', '', originalHeaders, host);
+        }
 
         const contentType = response.headers.get('content-type') || '';
 
@@ -63,18 +75,17 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         if (contentType.includes('text/html') || contentType.includes('json') || contentType.includes('javascript')) {
             let text = await response.text();
 
-            // Rewrite URLs carefully - Don't replace the domain string where it might be used for logic
+            // Rewrite URLs
             text = text.split(`https://${TARGET_DOMAIN}`).join(localBase);
             text = text.split(`//${TARGET_DOMAIN}`).join(`//${host}`);
             text = text.replace(/https?:\/\/([^/ \n\r"']+\.xhcdn\.com)/g, `${localBase}/_xh_assets/$1`);
 
-            // Mask Brand ONLY (Avoid touching domain names like xhamster.com in strings)
-            // This prevents the Cloudflare Error 1000
+            // Mask Brand
             text = text.replace(/xHamster(?!\\.com)/gi, 'PornHub');
             text = text.replace(/XHAMSTER/g, 'PORNHUB');
 
             if (contentType.includes('text/html')) {
-                text = injectNuclearBypass(text, localBase);
+                text = injectFinalBypass(text, localBase);
             }
 
             const outHeaders = new Headers();
@@ -93,40 +104,52 @@ export async function proxyRequest(path: string, searchParams: string, originalH
     }
 }
 
-function injectNuclearBypass(html: string, localBase: string) {
+function injectFinalBypass(html: string, localBase: string) {
     const $ = load(html);
 
-    // 1. Remove Any Possible Modals/Signup Walls via CSS
-    const antiWallStyle = `
+    // NUCLEAR CSS: Hide any overlay or modal aggressively
+    const style = `
     <style>
-        .signup-modal, .modal-overlay, #signup-popup, .age-verification, .lp-container,
-        [class*="signup"], [class*="login-wall"], [id*="signup"], 
-        div[style*="z-index"][style*="fixed"] {
+        /* Hide everything that looks like a landing page or age verification wall */
+        [class*="signup"], [id*="signup"], [class*="modal"], [id*="modal"],
+        .lp-container, .age-verification, .modal-overlay, #signup-popup,
+        div[style*="z-index"][style*="fixed"], 
+        div[style*="position: fixed"][style*="background: rgba(0, 0, 0, 0.5)"] {
             display: none !important; 
             visibility: hidden !important; 
             opacity: 0 !important; 
+            height: 0 !important;
+            width: 0 !important;
             pointer-events: none !important;
         }
-        body { overflow: auto !important; position: static !important; filter: none !important; }
-        .blurred, .blur { filter: none !important; }
+        body { overflow: auto !important; position: static !important; filter: none !important; padding-top: 0 !important; }
+        .blurred, .blur, .no-scroll { filter: none !important; overflow: auto !important; }
+        html.no-scroll { overflow: auto !important; }
     </style>
     `;
 
-    // 2. Client-side bypass script
-    const antiWallScript = `
+    const script = `
     <script>
         (function() {
-            // Force verify age
-            document.cookie = "ah_age_confirmed=true; path=/; max-age=31536000";
-            document.cookie = "is_adult=1; path=/; max-age=31536000";
+            // Force verification cookies in browser
+            const ck = ["age_confirmed=1", "is_adult=1", "ah_age_confirmed=true", "access_granted=true"];
+            ck.forEach(x => { document.cookie = x + "; path=/; max-age=31536000; sameSite=Lax"; });
             
-            // Kill modals permanently
-            setInterval(() => {
-                document.querySelectorAll('.signup-modal, .modal-overlay, #signup-popup, .lp-container').forEach(el => el.remove());
-                document.body.style.overflow = 'auto';
-            }, 500);
+            // If we are stuck on a landing page, force redirect to /videos after 1s
+            if (document.body.innerText.includes('Join PornHub') || document.body.innerText.includes('Sign up')) {
+                 if (window.location.pathname === '/' || window.location.pathname === '') {
+                    // window.location.href = '/videos';
+                 }
+            }
 
-            // Asset correction
+            // Continuous removal of any new modals
+            setInterval(() => {
+                document.querySelectorAll('[class*="signup"], [id*="signup"], [class*="modal"], .lp-container').forEach(el => el.remove());
+                document.body.classList.remove('no-scroll', 'blur');
+                document.documentElement.classList.remove('no-scroll');
+            }, 300);
+
+            // Link and Asset correction
             const LB = window.location.origin;
             const fix = (u) => {
                 if(!u || typeof u !== 'string' || u.startsWith(LB) || u.startsWith('/_xh_assets/')) return u;
@@ -151,10 +174,13 @@ function injectNuclearBypass(html: string, localBase: string) {
     </script>
     `;
 
-    $('head').prepend(antiWallStyle);
-    $('head').prepend(antiWallScript);
+    $('head').prepend(style);
+    $('head').prepend(script);
     if (!$('base').length) $('head').prepend(`<base href="${localBase}/">`);
     else $('base').attr('href', localBase + '/');
+
+    // Remove elements from DOM completely if they match known wall classes
+    $('.signup-modal, .modal-overlay, #signup-popup, .lp-container, .age-verification').remove();
 
     return $.html();
 }
@@ -170,7 +196,7 @@ async function proxyAsset(url: string, originalHeaders: Headers, localBase: stri
         const response = await fetch(url, { headers });
         const contentType = response.headers.get('content-type') || '';
 
-        if (url.endsWith('.m3u8') || contentType.includes('mpegurl')) {
+        if (url.endsWith('.m3u8')) {
             let content = await response.text();
             content = content.replace(/https?:\/\/([^/]+\.xhcdn\.com)(\/.*)/g, (m, d, p) => `${localBase}/_xh_assets/${d}${p}`);
             return new Response(content, { headers: { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' } });
