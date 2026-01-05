@@ -7,7 +7,7 @@ export async function proxyRequest(path: string, searchParams: string, originalH
     const protocol = host.includes('localhost') ? 'http' : 'https';
     const localBase = `${protocol}://${host}`;
 
-    // 1. Asset Proxying (Static files)
+    // 1. Asset Proxying (Recursive check)
     if (path.startsWith('_xh_assets/')) {
         let actualAssetUrl = path.replace('_xh_assets/', '');
         if (actualAssetUrl.includes('_xh_assets/')) {
@@ -19,37 +19,19 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         return proxyAsset(actualAssetUrl, originalHeaders, localBase);
     }
 
-    // 2. INTERNAL REDIRECT: Bypass landing page for root
-    const targetPath = (path === '' || path === '/') ? 'videos' : path;
-    const url = `${TARGET_URL}/${targetPath}${searchParams ? `?${searchParams}` : ''}`;
+    const url = `${TARGET_URL}/${path}${searchParams ? `?${searchParams}` : ''}`;
 
     try {
         const headers = new Headers();
-        headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
-        headers.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8');
-        headers.set('Accept-Language', 'en-US,en;q=0.9');
-        headers.set('Referer', 'https://www.google.com/');
+        headers.set('User-Agent', originalHeaders.get('user-agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+        headers.set('Accept', originalHeaders.get('accept') || '*/*');
+        headers.set('Referer', TARGET_URL);
 
-        // PASS THE USER'S REAL IP (Azerbaijan IP) to bypass Virginia/USA wall
-        const userIP = originalHeaders.get('x-forwarded-for')?.split(',')[0].trim();
-        if (userIP) {
-            headers.set('X-Forwarded-For', userIP);
-            headers.set('X-Real-IP', userIP);
-            headers.set('True-Client-IP', userIP);
-        } else {
-            // Fallback random residential-like IP if forwarder fails
-            const randIP = `92.40.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
-            headers.set('X-Forwarded-For', randIP);
-        }
+        const cookie = originalHeaders.get('cookie');
+        if (cookie) headers.set('Cookie', cookie);
 
-        // Force Global Verification Headers
-        headers.set('RTA', '1'); // Restricted to Adults
-
-        let cookieArr = [];
-        const existingCookie = originalHeaders.get('cookie');
-        if (existingCookie) cookieArr.push(existingCookie);
-        cookieArr.push('age_confirmed=1', 'is_adult=1', 'ah_age_confirmed=true', 'f_adult=1', 'access_granted=true');
-        headers.set('Cookie', cookieArr.join('; '));
+        const range = originalHeaders.get('range');
+        if (range) headers.set('Range', range);
 
         const response = await fetch(url, {
             method: 'GET',
@@ -59,39 +41,43 @@ export async function proxyRequest(path: string, searchParams: string, originalH
 
         const contentType = response.headers.get('content-type') || '';
 
-        // Media files pass-through
+        // Return directly if it's a video/media stream to avoid loading it into memory
         if (contentType.includes('video/') || contentType.includes('audio/') || contentType.includes('image/') || contentType.includes('font/')) {
-            const h = new Headers();
-            h.set('Content-Type', contentType);
-            h.set('Access-Control-Allow-Origin', '*');
-            if (response.headers.has('content-range')) h.set('Content-Range', response.headers.get('content-range')!);
-            return new Response(response.body, { status: response.status, headers: h });
-        }
-
-        // Textual content processing
-        if (contentType.includes('text/html') || contentType.includes('json') || contentType.includes('javascript')) {
-            let text = await response.text();
-
-            // Rewrite URLs
-            text = text.split(`https://${TARGET_DOMAIN}`).join(localBase);
-            text = text.split(`//${TARGET_DOMAIN}`).join(`//${host}`);
-            text = text.replace(/https?:\/\/([^/ \n\r"']+\.xhcdn\.com)/g, `${localBase}/_xh_assets/$1`);
-
-            // Mask Brand ONLY (Strict fix for Error 1000)
-            text = text.replace(/xHamster(?!\\.com)/gi, 'PornHub');
-            text = text.replace(/XHAMSTER/g, 'PORNHUB');
-
-            if (contentType.includes('text/html')) {
-                text = injectFinalBypass(text, localBase);
-            }
-
             const outHeaders = new Headers();
             outHeaders.set('Content-Type', contentType);
             outHeaders.set('Access-Control-Allow-Origin', '*');
-            const setCookie = response.headers.get('set-cookie');
-            if (setCookie) outHeaders.set('Set-Cookie', setCookie.replace(/domain=\.?xhamster\.com/gi, ''));
+            if (response.headers.has('content-range')) outHeaders.set('Content-Range', response.headers.get('content-range')!);
+            if (response.headers.has('accept-ranges')) outHeaders.set('Accept-Ranges', 'bytes');
+            if (response.headers.has('content-length')) outHeaders.set('Content-Length', response.headers.get('content-length')!);
 
-            return new Response(text, { status: response.status, headers: outHeaders });
+            return new Response(response.body, {
+                status: response.status,
+                headers: outHeaders,
+            });
+        }
+
+        // Handle HTML
+        if (contentType.includes('text/html')) {
+            let html = await response.text();
+            html = rewriteHtml(html, host);
+
+            return new Response(html, {
+                status: response.status,
+                headers: { 'Content-Type': 'text/html; charset=utf-8' },
+            });
+        }
+
+        // Handle JSON/API/JS
+        if (contentType.includes('application/json') || contentType.includes('javascript')) {
+            let text = await response.text();
+            text = text.split(`https://${TARGET_DOMAIN}`).join(localBase);
+            text = text.split(`//${TARGET_DOMAIN}`).join(`//${host}`);
+            text = text.replace(/https?:\/\/([^/]+\.xhcdn\.com)/g, `${localBase}/_xh_assets/$1`);
+
+            return new Response(text, {
+                status: response.status,
+                headers: { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' },
+            });
         }
 
         return new Response(response.body, { status: response.status, headers: { 'Content-Type': contentType } });
@@ -99,83 +85,6 @@ export async function proxyRequest(path: string, searchParams: string, originalH
     } catch (error) {
         return new Response('Proxy Error', { status: 502 });
     }
-}
-
-function injectFinalBypass(html: string, localBase: string) {
-    const $ = load(html);
-
-    // NUCLEAR CSS: Ensure no modals are visible
-    const style = `
-    <style>
-        .signup-modal, .modal-overlay, #signup-popup, .lp-container, .age-verification,
-        div[style*="z-index: 1000"], div[style*="z-index: 99999"], 
-        [class*="signup"], [id*="signup"], [class*="modal"] {
-            display: none !important; 
-            visibility: hidden !important; 
-            opacity: 0 !important;
-            pointer-events: none !important;
-        }
-        body { overflow: auto !important; position: static !important; filter: none !important; }
-        .blurred, .blur { filter: none !important; }
-    </style>
-    `;
-
-    // NUCLEAR JS: Kill the wall as soon as it appears
-    const script = `
-    <script>
-        (function() {
-            // Force verification in browser
-            document.cookie = "ah_age_confirmed=true; path=/; max-age=31536000";
-            document.cookie = "is_adult=1; path=/; max-age=31536000";
-            
-            // Detect and Flush Wall
-            const flush = () => {
-                document.querySelectorAll('.signup-modal, .modal-overlay, #signup-popup, .lp-container').forEach(e => e.remove());
-                if (document.body.innerText.includes('Join PornHub') || document.body.innerText.includes('Sign up')) {
-                    // If we see the wall, we are on the wrong page. Redirect to /videos
-                    if (window.location.pathname === '/' || window.location.pathname === '') {
-                        window.location.href = '/videos';
-                    }
-                }
-                document.body.style.overflow = 'auto';
-            };
-            
-            setInterval(flush, 200);
-            
-            // Asset correction
-            const LB = window.location.origin;
-            const fix = (u) => {
-                if(!u || typeof u !== 'string' || u.startsWith(LB) || u.startsWith('/_xh_assets/')) return u;
-                if(u.includes('xhamster.com')) return u.replace(/https?:\\/\\/xhamster\\.com/g, LB);
-                if(u.includes('xhcdn.com')) {
-                    const m = u.match(/https?:\\/\\/([^/]+\\.xhcdn\\.com)(\\/.*)/);
-                    if(m) return LB + '/_xh_assets/' + m[1] + m[2];
-                }
-                return u;
-            };
-            
-            new MutationObserver(ms => ms.forEach(m => {
-                m.addedNodes.forEach(n => {
-                    if(n.nodeType !== 1) return;
-                    ['href','src','data-src','data-thumb','poster'].forEach(a => {
-                        const v = n.getAttribute(a);
-                        if(v) n.setAttribute(a, fix(v));
-                    });
-                });
-            })).observe(document.documentElement, {childList:true, subtree:true});
-        })();
-    </script>
-    `;
-
-    $('head').prepend(style);
-    $('head').prepend(script);
-    if (!$('base').length) $('head').prepend(`<base href="${localBase}/">`);
-    else $('base').attr('href', localBase + '/');
-
-    // Clean initial DOM
-    $('.signup-modal, .modal-overlay, #signup-popup, .lp-container').remove();
-
-    return $.html();
 }
 
 async function proxyAsset(url: string, originalHeaders: Headers, localBase: string) {
@@ -189,16 +98,86 @@ async function proxyAsset(url: string, originalHeaders: Headers, localBase: stri
         const response = await fetch(url, { headers });
         const contentType = response.headers.get('content-type') || '';
 
-        if (url.endsWith('.m3u8')) {
+        if (url.endsWith('.m3u8') || contentType.includes('mpegurl')) {
             let content = await response.text();
-            content = content.replace(/https?:\/\/([^/]+\.xhcdn\.com)(\/.*)/g, (m, d, p) => `${localBase}/_xh_assets/${d}${p}`);
+            content = content.replace(/https?:\/\/([^/]+)(\/.*)/g, (match, domain, path) => {
+                if (domain.includes('localhost')) return match;
+                return `${localBase}/_xh_assets/${domain}${path}`;
+            });
             return new Response(content, { headers: { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' } });
         }
 
         const h = new Headers();
         h.set('Content-Type', contentType);
         h.set('Access-Control-Allow-Origin', '*');
+        h.set('Cache-Control', 'public, max-age=31536000');
         if (response.headers.has('content-range')) h.set('Content-Range', response.headers.get('content-range')!);
+        if (response.headers.has('content-length')) h.set('Content-Length', response.headers.get('content-length')!);
+
         return new Response(response.body, { status: response.status, headers: h });
-    } catch (e) { return new Response('Not Found', { status: 404 }); }
+    } catch (e) {
+        return new Response('Asset Not Found', { status: 404 });
+    }
+}
+
+function rewriteHtml(html: string, host: string): string {
+    const protocol = host.includes('localhost') ? 'http' : 'https';
+    const localBase = `${protocol}://${host}`;
+    const $ = load(html);
+
+    // Remove anti-proxy/analytics
+    $('meta[http-equiv="Content-Security-Policy"]').remove();
+    $('script[src*="google-analytics"], script[src*="googletagmanager"], script[src*="histats"], script[src*="mcore.com"]').remove();
+
+    // Helper script for dynamic links (Optimized)
+    const helperScript = `
+    (function() {
+        const LB = window.location.origin;
+        const TD = 'xhamster.com';
+        
+        function fU(u) {
+            if (!u || typeof u !== 'string' || u.startsWith(LB) || u.startsWith('/_xh_assets/')) return u;
+            // Strict check: must contain xhamster.com but NOT xhamsterlive.com
+            if (u.includes(TD) && !u.includes('xhamsterlive.com')) {
+                u = u.replace('https://'+TD, LB).replace('//'+TD, LB);
+            }
+            if (u.includes('xhcdn.com')) {
+                const m = u.match(/https?:\\/\\/([^/]+\\.xhcdn\\.com)(\\/.*)/);
+                if (m) u = LB + '/_xh_assets/' + m[1] + m[2];
+            }
+            return u;
+        }
+
+        function pN(n) {
+            if (n.nodeType !== 1) return;
+            ['href','src','data-src','data-thumb','poster','data-mp4','data-m3u8'].forEach(a => {
+                const v = n.getAttribute(a);
+                if (v) { const nv = fU(v); if(nv!==v) n.setAttribute(a, nv); }
+            });
+        }
+
+        const obs = new MutationObserver(ms => ms.forEach(m => {
+            m.addedNodes.forEach(pN);
+            if(m.type==='attributes') pN(m.target);
+        }));
+        obs.observe(document.documentElement, {childList:true, subtree:true, attributes:true, attributeFilter:['href','src','data-src','style']});
+        
+        // Bridge for XHR/Fetch
+        const oF = window.fetch; window.fetch = (i, t) => oF(typeof i==='string'?fU(i):i, t);
+        const oO = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m, u) { return oO.apply(this, [m, typeof u==='string'?fU(u):u]); };
+    })();
+    `;
+    $('head').prepend(`<script>${helperScript}</script>`);
+    $('head').prepend(`<base href="${localBase}/">`);
+
+    let output = $.html();
+    // Global replacement for static parts (Using safer regex to not touch live.com)
+    output = output.replace(/https?:\/\/xhamster\.com(?!\/)/g, localBase);
+    output = output.replace(/https?:\/\/xhamster\.com\//g, localBase + '/');
+    output = output.replace(/\/\/xhamster\.com/g, '//' + host);
+
+    output = output.replace(/https?:\/\/([^/]+\.xhcdn\.com)/g, `${localBase}/_xh_assets/$1`);
+    output = output.replace(/xHamster(?!Live)/gi, 'PornHub');
+
+    return output;
 }
