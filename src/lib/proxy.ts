@@ -7,7 +7,7 @@ export async function proxyRequest(path: string, searchParams: string, originalH
     const protocol = host.includes('localhost') ? 'http' : 'https';
     const localBase = `${protocol}://${host}`;
 
-    // 1. Asset Proxying
+    // 1. Asset Proxying (Static files)
     if (path.startsWith('_xh_assets/')) {
         let actualAssetUrl = path.replace('_xh_assets/', '');
         if (actualAssetUrl.includes('_xh_assets/')) {
@@ -19,13 +19,9 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         return proxyAsset(actualAssetUrl, originalHeaders, localBase);
     }
 
-    // 2. INTERNAL REDIRECT: Redirect root to /videos to bypass root landing page
-    let finalPath = path;
-    if (path === '' || path === '/') {
-        finalPath = 'videos';
-    }
-
-    const url = `${TARGET_URL}/${finalPath}${searchParams ? `?${searchParams}` : ''}`;
+    // 2. INTERNAL REDIRECT: Bypass landing page for root
+    const targetPath = (path === '' || path === '/') ? 'videos' : path;
+    const url = `${TARGET_URL}/${targetPath}${searchParams ? `?${searchParams}` : ''}`;
 
     try {
         const headers = new Headers();
@@ -34,18 +30,25 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         headers.set('Accept-Language', 'en-US,en;q=0.9');
         headers.set('Referer', 'https://www.google.com/');
 
-        // Pass real user IP headers
-        const clientIP = originalHeaders.get('x-forwarded-for')?.split(',')[0].trim();
-        if (clientIP) {
-            headers.set('X-Forwarded-For', clientIP);
-            headers.set('X-Real-IP', clientIP);
+        // PASS THE USER'S REAL IP (Azerbaijan IP) to bypass Virginia/USA wall
+        const userIP = originalHeaders.get('x-forwarded-for')?.split(',')[0].trim();
+        if (userIP) {
+            headers.set('X-Forwarded-For', userIP);
+            headers.set('X-Real-IP', userIP);
+            headers.set('True-Client-IP', userIP);
+        } else {
+            // Fallback random residential-like IP if forwarder fails
+            const randIP = `92.40.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+            headers.set('X-Forwarded-For', randIP);
         }
 
-        // Force Cookies for Age Verification and bypassing landing pages
+        // Force Global Verification Headers
+        headers.set('RTA', '1'); // Restricted to Adults
+
         let cookieArr = [];
         const existingCookie = originalHeaders.get('cookie');
         if (existingCookie) cookieArr.push(existingCookie);
-        cookieArr.push('age_confirmed=1', 'is_adult=1', 'ah_age_confirmed=true', 'f_adult=1', 'is_mature=1', 'access_granted=true');
+        cookieArr.push('age_confirmed=1', 'is_adult=1', 'ah_age_confirmed=true', 'f_adult=1', 'access_granted=true');
         headers.set('Cookie', cookieArr.join('; '));
 
         const response = await fetch(url, {
@@ -54,15 +57,9 @@ export async function proxyRequest(path: string, searchParams: string, originalH
             redirect: 'follow',
         });
 
-        // 3. SECONARY BYPASS: If even /videos gives a wall (redirects to /lp/ or /signup)
-        if (response.url.includes('/lp/') || response.url.includes('/signup') || response.url.includes('/join')) {
-            // Try a very specific deep link that is hard to wall
-            if (!path.includes('best')) return proxyRequest('best', '', originalHeaders, host);
-        }
-
         const contentType = response.headers.get('content-type') || '';
 
-        // Return media as-is
+        // Media files pass-through
         if (contentType.includes('video/') || contentType.includes('audio/') || contentType.includes('image/') || contentType.includes('font/')) {
             const h = new Headers();
             h.set('Content-Type', contentType);
@@ -80,7 +77,7 @@ export async function proxyRequest(path: string, searchParams: string, originalH
             text = text.split(`//${TARGET_DOMAIN}`).join(`//${host}`);
             text = text.replace(/https?:\/\/([^/ \n\r"']+\.xhcdn\.com)/g, `${localBase}/_xh_assets/$1`);
 
-            // Mask Brand
+            // Mask Brand ONLY (Strict fix for Error 1000)
             text = text.replace(/xHamster(?!\\.com)/gi, 'PornHub');
             text = text.replace(/XHAMSTER/g, 'PORNHUB');
 
@@ -107,49 +104,45 @@ export async function proxyRequest(path: string, searchParams: string, originalH
 function injectFinalBypass(html: string, localBase: string) {
     const $ = load(html);
 
-    // NUCLEAR CSS: Hide any overlay or modal aggressively
+    // NUCLEAR CSS: Ensure no modals are visible
     const style = `
     <style>
-        /* Hide everything that looks like a landing page or age verification wall */
-        [class*="signup"], [id*="signup"], [class*="modal"], [id*="modal"],
-        .lp-container, .age-verification, .modal-overlay, #signup-popup,
-        div[style*="z-index"][style*="fixed"], 
-        div[style*="position: fixed"][style*="background: rgba(0, 0, 0, 0.5)"] {
+        .signup-modal, .modal-overlay, #signup-popup, .lp-container, .age-verification,
+        div[style*="z-index: 1000"], div[style*="z-index: 99999"], 
+        [class*="signup"], [id*="signup"], [class*="modal"] {
             display: none !important; 
             visibility: hidden !important; 
-            opacity: 0 !important; 
-            height: 0 !important;
-            width: 0 !important;
+            opacity: 0 !important;
             pointer-events: none !important;
         }
-        body { overflow: auto !important; position: static !important; filter: none !important; padding-top: 0 !important; }
-        .blurred, .blur, .no-scroll { filter: none !important; overflow: auto !important; }
-        html.no-scroll { overflow: auto !important; }
+        body { overflow: auto !important; position: static !important; filter: none !important; }
+        .blurred, .blur { filter: none !important; }
     </style>
     `;
 
+    // NUCLEAR JS: Kill the wall as soon as it appears
     const script = `
     <script>
         (function() {
-            // Force verification cookies in browser
-            const ck = ["age_confirmed=1", "is_adult=1", "ah_age_confirmed=true", "access_granted=true"];
-            ck.forEach(x => { document.cookie = x + "; path=/; max-age=31536000; sameSite=Lax"; });
+            // Force verification in browser
+            document.cookie = "ah_age_confirmed=true; path=/; max-age=31536000";
+            document.cookie = "is_adult=1; path=/; max-age=31536000";
             
-            // If we are stuck on a landing page, force redirect to /videos after 1s
-            if (document.body.innerText.includes('Join PornHub') || document.body.innerText.includes('Sign up')) {
-                 if (window.location.pathname === '/' || window.location.pathname === '') {
-                    // window.location.href = '/videos';
-                 }
-            }
-
-            // Continuous removal of any new modals
-            setInterval(() => {
-                document.querySelectorAll('[class*="signup"], [id*="signup"], [class*="modal"], .lp-container').forEach(el => el.remove());
-                document.body.classList.remove('no-scroll', 'blur');
-                document.documentElement.classList.remove('no-scroll');
-            }, 300);
-
-            // Link and Asset correction
+            // Detect and Flush Wall
+            const flush = () => {
+                document.querySelectorAll('.signup-modal, .modal-overlay, #signup-popup, .lp-container').forEach(e => e.remove());
+                if (document.body.innerText.includes('Join PornHub') || document.body.innerText.includes('Sign up')) {
+                    // If we see the wall, we are on the wrong page. Redirect to /videos
+                    if (window.location.pathname === '/' || window.location.pathname === '') {
+                        window.location.href = '/videos';
+                    }
+                }
+                document.body.style.overflow = 'auto';
+            };
+            
+            setInterval(flush, 200);
+            
+            // Asset correction
             const LB = window.location.origin;
             const fix = (u) => {
                 if(!u || typeof u !== 'string' || u.startsWith(LB) || u.startsWith('/_xh_assets/')) return u;
@@ -179,8 +172,8 @@ function injectFinalBypass(html: string, localBase: string) {
     if (!$('base').length) $('head').prepend(`<base href="${localBase}/">`);
     else $('base').attr('href', localBase + '/');
 
-    // Remove elements from DOM completely if they match known wall classes
-    $('.signup-modal, .modal-overlay, #signup-popup, .lp-container, .age-verification').remove();
+    // Clean initial DOM
+    $('.signup-modal, .modal-overlay, #signup-popup, .lp-container').remove();
 
     return $.html();
 }
