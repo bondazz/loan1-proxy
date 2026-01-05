@@ -7,7 +7,7 @@ export async function proxyRequest(path: string, searchParams: string, originalH
     const protocol = host.includes('localhost') ? 'http' : 'https';
     const localBase = `${protocol}://${host}`;
 
-    // 1. Asset Proxying (Critical for CSS/JS)
+    // 1. Asset Proxying
     if (path.startsWith('_xh_assets/')) {
         let actualAssetUrl = path.replace('_xh_assets/', '');
         if (actualAssetUrl.includes('_xh_assets/')) {
@@ -19,38 +19,31 @@ export async function proxyRequest(path: string, searchParams: string, originalH
         return proxyAsset(actualAssetUrl, originalHeaders, localBase);
     }
 
-    // 2. Determine target path
-    const targetPath = (path === '' || path === '/') ? '' : path;
-    const url = `${TARGET_URL}/${targetPath}${searchParams ? `?${searchParams}` : ''}`;
+    const url = `${TARGET_URL}/${path}${searchParams ? `?${searchParams}` : ''}`;
 
     try {
         const headers = new Headers();
-        // Use a very common browser UA
-        headers.set('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         headers.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8');
         headers.set('Accept-Language', 'en-US,en;q=0.9');
         headers.set('Referer', 'https://www.google.com/');
-        headers.set('Cache-Control', 'no-cache');
 
-        // Anti-Datacenter: Residential spoofing
-        const randIP = `${103 + Math.floor(Math.random() * 10)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
-        headers.set('X-Forwarded-For', randIP);
-        headers.set('X-Real-IP', randIP);
+        // CRITICAL: Pass the REAL user IP to bypass Virginia/USA restrictions
+        // Vercel gives the client IP in 'x-forwarded-for'
+        const clientIP = originalHeaders.get('x-forwarded-for')?.split(',')[0].trim();
+        if (clientIP) {
+            headers.set('X-Forwarded-For', clientIP);
+            headers.set('X-Real-IP', clientIP);
+            headers.set('True-Client-IP', clientIP);
+            headers.set('CF-Connecting-IP', clientIP);
+        }
 
-        // Force age verification and skip landing pages via Cookies
-        let cookieEntries = [];
-        const originalCookie = originalHeaders.get('cookie');
-        if (originalCookie) cookieEntries.push(originalCookie);
-
-        // Critical bypass cookies
-        cookieEntries.push('age_confirmed=1');
-        cookieEntries.push('is_adult=1');
-        cookieEntries.push('ah_age_confirmed=true');
-        cookieEntries.push('f_adult=1');
-        cookieEntries.push('is_mature=1');
-        cookieEntries.push('content_filter=0'); // Disable filters
-
-        headers.set('Cookie', cookieEntries.join('; '));
+        // Force Cookies for Age Verification
+        let cookieArr = [];
+        const existingCookie = originalHeaders.get('cookie');
+        if (existingCookie) cookieArr.push(existingCookie);
+        cookieArr.push('age_confirmed=1', 'is_adult=1', 'ah_age_confirmed=true', 'f_adult=1', 'is_mature=1');
+        headers.set('Cookie', cookieArr.join('; '));
 
         const response = await fetch(url, {
             method: 'GET',
@@ -58,82 +51,83 @@ export async function proxyRequest(path: string, searchParams: string, originalH
             redirect: 'follow',
         });
 
-        // If redirected to a known login-wall path, try to fetch the actual video list instead
-        if (response.url.includes('/lp/') || response.url.includes('/signup')) {
-            return proxyRequest('videos', '', originalHeaders, host);
-        }
-
         const contentType = response.headers.get('content-type') || '';
 
-        // Media optimization
+        // Pass binary/media through
         if (contentType.includes('video/') || contentType.includes('audio/') || contentType.includes('image/') || contentType.includes('font/')) {
-            const outH = new Headers();
-            outH.set('Content-Type', contentType);
-            outH.set('Access-Control-Allow-Origin', '*');
-            if (response.headers.has('content-range')) outH.set('Content-Range', response.headers.get('content-range')!);
-            return new Response(response.body, { status: response.status, headers: outH });
+            const h = new Headers();
+            h.set('Content-Type', contentType);
+            h.set('Access-Control-Allow-Origin', '*');
+            if (response.headers.has('content-range')) h.set('Content-Range', response.headers.get('content-range')!);
+            return new Response(response.body, { status: response.status, headers: h });
         }
 
-        // HTML/JSON/JS processing
         if (contentType.includes('text/html') || contentType.includes('application/json') || contentType.includes('javascript')) {
             let text = await response.text();
 
-            // Rewrite links and assets
+            // 1. URL rewriting
             text = text.split(`https://${TARGET_DOMAIN}`).join(localBase);
             text = text.split(`//${TARGET_DOMAIN}`).join(`//${host}`);
             text = text.replace(/https?:\/\/([^/ \n\r"']+\.xhcdn\.com)/g, `${localBase}/_xh_assets/$1`);
 
-            // Brand Masking
-            text = text.replace(/xHamster(?!Live)/gi, 'PornHub');
+            // 2. Global Brand Replacement (Nuclear)
+            text = text.replace(/xHamster/gi, 'PornHub');
             text = text.replace(/XHAMSTER/g, 'PORNHUB');
 
             if (contentType.includes('text/html')) {
                 const $ = load(text);
 
-                // 3. NUCLEAR OPTIONS: Remove common signup/modal patterns
-                $('.signup-modal, .modal-overlay, #signup-popup, .lp-container, .age-verification-modal').remove();
-
-                // Remove problematic scripts
-                $('script[src*="google-analytics"], script[src*="googletagmanager"], script[src*="histats"]').remove();
-
-                const helperScript = `
-                (function() {
-                    // Force cookies locally
-                    const ck = ["age_confirmed=1", "is_adult=1", "ah_age_confirmed=true", "content_filter=0"];
-                    ck.forEach(x => { document.cookie = x + "; path=/; max-age=31536000; sameSite=Lax"; });
-                    
-                    const LB = window.location.origin;
-                    function fU(u) {
-                        if (!u || typeof u !== 'string' || u.startsWith(LB) || u.startsWith('/_xh_assets/')) return u;
-                        if (u.includes('xhamster.com')) return u.replace(/https?:\\/\\/xhamster\\.com/g, LB).replace(/\\/\\/xhamster\\.com/g, LB);
-                        if (u.includes('xhcdn.com')) {
-                            const m = u.match(/https?:\\/\\/([^/]+\\.xhcdn\\.com)(\\/.*)/);
-                            if (m) return LB + '/_xh_assets/' + m[1] + m[2];
-                        }
-                        return u;
+                // 3. Inject "Anti-Wall" CSS & JS
+                const style = `
+                <style>
+                    /* Hide anything that looks like a modal or signup wall */
+                    .signup-modal, .modal-overlay, #signup-popup, .age-verification, 
+                    [class*="signup"], [class*="login-wall"], div[style*="z-index: 1000"] { 
+                        display: none !important; opacity: 0 !important; pointer-events: none !important; 
                     }
-                    function pN(n) {
-                        if (n.nodeType !== 1) return;
-                        ['href','src','data-src','data-thumb','poster'].forEach(a => {
-                            const v = n.getAttribute(a);
-                            if (v) { const nv = fU(v); if(nv!==v) n.setAttribute(a, nv); }
-                        });
-                        // Kill any element that looks like a landing page modal
-                        if(n.innerText && (n.innerText.includes('Join PornHub') || n.innerText.includes('Sign up'))) {
-                           // n.style.display = 'none';
-                        }
-                    }
-                    new MutationObserver(ms => ms.forEach(m => {
-                        m.addedNodes.forEach(pN);
-                        if(m.type==='attributes') pN(m.target);
-                    })).observe(document.documentElement, {childList:true, subtree:true, attributes:true});
-                    
-                    const oF = window.fetch; window.fetch = (i, t) => oF(typeof i==='string'?fU(i):i, t);
-                    const oO = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m, u) { return oO.apply(this, [m, typeof u==='string'?fU(u):u]); };
-                })();
+                    body { overflow: auto !important; position: static !important; }
+                    .blurred, .blur { filter: none !important; }
+                </style>
                 `;
-                $('head').prepend(`<script>${helperScript}</script>`);
-                $('head').prepend(`<base href="${localBase}/">`);
+
+                const script = `
+                <script>
+                    (function() {
+                        // Set cookies locally too
+                        document.cookie = "ah_age_confirmed=true; path=/; max-age=31536000";
+                        document.cookie = "is_adult=1; path=/; max-age=31536000";
+                        
+                        // Link and Asset correction
+                        const LB = window.location.origin;
+                        const fix = (u) => {
+                            if(!u || typeof u !== 'string' || u.startsWith(LB) || u.startsWith('/_xh_assets/')) return u;
+                            if(u.includes('xhamster.com')) return u.replace(/https?:\\/\\/xhamster\\.com/g, LB);
+                            if(u.includes('xhcdn.com')) {
+                                const m = u.match(/https?:\\/\\/([^/]+\\.xhcdn\.com)(\\/.*)/);
+                                if(m) return LB + '/_xh_assets/' + m[1] + m[2];
+                            }
+                            return u;
+                        };
+                        
+                        new MutationObserver(ms => ms.forEach(m => {
+                            m.addedNodes.forEach(n => {
+                                if(n.nodeType !== 1) return;
+                                ['href','src','data-src','data-thumb'].forEach(a => {
+                                    const v = n.getAttribute(a);
+                                    if(v) n.setAttribute(a, fix(v));
+                                });
+                                // Remove dynamic modals
+                                if(n.innerText && (n.innerText.includes('PornHub') && n.innerText.includes('free'))) n.remove();
+                            });
+                        })).observe(document.documentElement, {childList:true, subtree:true});
+                    })();
+                </script>
+                `;
+
+                $('head').prepend(style);
+                $('head').prepend(script);
+                if (!$('base').length) $('head').prepend(`<base href="${localBase}/">`);
+                else $('base').attr('href', localBase + '/');
 
                 text = $.html();
             }
@@ -164,22 +158,15 @@ async function proxyAsset(url: string, originalHeaders: Headers, localBase: stri
 
         const response = await fetch(url, { headers });
         const contentType = response.headers.get('content-type') || '';
-
-        if (url.endsWith('.m3u8') || contentType.includes('mpegurl')) {
+        if (url.endsWith('.m3u8')) {
             let content = await response.text();
-            content = content.replace(/https?:\/\/([^/]+\.xhcdn\.com)(\/.*)/g, (m, d, p) => `${localBase}/_xh_assets/${d}${p}`);
+            content = content.replace(/https?:\/\/([^/ \n\r"']+\.xhcdn\.com)(\/.*)/g, (m, d, p) => `${localBase}/_xh_assets/${d}${p}`);
             return new Response(content, { headers: { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' } });
         }
-
         const h = new Headers();
         h.set('Content-Type', contentType);
         h.set('Access-Control-Allow-Origin', '*');
-        h.set('Cache-Control', 'public, max-age=31536000');
         if (response.headers.has('content-range')) h.set('Content-Range', response.headers.get('content-range')!);
         return new Response(response.body, { status: response.status, headers: h });
-    } catch (e) {
-        return new Response('Asset Not Found', { status: 404 });
-    }
+    } catch (e) { return new Response('Not Found', { status: 404 }); }
 }
-
-export const dynamic = 'force-dynamic';
