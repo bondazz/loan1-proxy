@@ -167,6 +167,17 @@ function rewriteHtml(html: string, host: string): string {
         const oO = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m, u) { return oO.apply(this, [m, typeof u==='string'?fU(u):u]); };
     })();
     `;
+    const analyticsScript = `
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-3PPBJV27D2"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-3PPBJV27D2');
+    </script>
+    `;
+    $('head').prepend(analyticsScript);
     $('head').prepend(`<script>${helperScript}</script>`);
     $('head').prepend(`<base href="${localBase}/">`);
 
